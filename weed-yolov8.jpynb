@@ -1,0 +1,318 @@
+# Import'lar
+import os
+import json
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from transformers import DetrImageProcessor, DetrForObjectDetection
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings("ignore")
+
+print("✅ Kurulum tamamlandı!")
+
+# =============================================================================
+# BLOK 2: Drive Bağlantısı ve Veri Yükleme
+# =============================================================================
+
+# Veri yollarını tanımla
+IMAGE_DIR = "/content/drive/MyDrive/tutun/tutun"  # Resim klasörü
+ANNOTATION_FILE = "/content/drive/MyDrive/Tobacco_Project/dataset/labels_my-project-name_2025-06-16-11-20-57.json"  # JSON dosyası
+
+print(f"🖼️ Image directory: {IMAGE_DIR}")
+print(f"📝 Annotation file: {ANNOTATION_FILE}")
+
+# Dosya kontrolü
+if os.path.exists(ANNOTATION_FILE):
+    print("✅ Annotation dosyası bulundu!")
+else:
+    print("❌ Annotation dosyası bulunamadı! Yolu kontrol edin.")
+
+if os.path.exists(IMAGE_DIR):
+    image_count = len([f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+    print(f"✅ {image_count} adet resim bulundu!")
+else:
+    print("❌ Resim klasörü bulunamadı! Yolu kontrol edin.")
+
+!pip install ultralytics
+
+# =============================================================================
+# BLOK 3: JSON Veri Analizi ve Sınıf Bilgilerini Çıkarma
+# =============================================================================
+
+import json
+from collections import Counter
+
+def analyze_json_data(annotation_file):
+    """JSON dosyasını analiz et ve sınıf bilgilerini çıkar"""
+    with open(annotation_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    print("📊 JSON Veri Analizi:")
+    print(f"Total images: {len(data.get('images', []))}")
+    print(f"Total annotations: {len(data.get('annotations', []))}")
+    print(f"Categories: {len(data.get('categories', []))}")
+
+    # Kategori bilgilerini çıkar
+    categories = data.get('categories', [])
+    category_dict = {cat['id']: cat['name'] for cat in categories}
+
+    print("\n🏷️ Tespit edilecek sınıflar:")
+    for cat_id, cat_name in category_dict.items():
+        print(f"  {cat_id}: {cat_name}")
+
+    # Annotation sayılarını say
+    annotations = data.get('annotations', [])
+    category_counts = Counter([ann['category_id'] for ann in annotations])
+
+    print("\n📈 Sınıf dağılımı:")
+    for cat_id, count in category_counts.items():
+        cat_name = category_dict.get(cat_id, 'Unknown')
+        print(f"  {cat_name}: {count} annotation")
+
+    return data, category_dict
+
+# JSON verisini analiz et
+if os.path.exists(ANNOTATION_FILE):
+    coco_data, class_names = analyze_json_data(ANNOTATION_FILE)
+else:
+    print("❌ JSON dosyası bulunamadı!")
+import shutil
+
+# BLOK 4: COCO Formatından YOLO Formatına Dönüştürme
+# =============================================================================
+
+def convert_coco_to_yolo(coco_data, image_dir, output_dir):
+    """COCO formatındaki veriyi YOLO formatına dönüştür"""
+
+    # Çıkış klasörlerini oluştur
+    images_dir = os.path.join(output_dir, 'images')
+    labels_dir = os.path.join(output_dir, 'labels')
+
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+
+    # Image ID'den filename'e mapping
+    images_info = {img['id']: img for img in coco_data['images']}
+
+    # Her resim için YOLO formatında label dosyası oluştur
+    for image_info in coco_data['images']:
+        image_id = image_info['id']
+        filename = image_info['file_name']
+        width = image_info['width']
+        height = image_info['height']
+
+        # Bu resme ait annotationları bul
+        image_annotations = [ann for ann in coco_data['annotations']
+                           if ann['image_id'] == image_id]
+
+        # YOLO formatında label dosyası oluştur
+        label_filename = os.path.splitext(filename)[0] + '.txt'
+        label_path = os.path.join(labels_dir, label_filename)
+
+        with open(label_path, 'w') as f:
+            for ann in image_annotations:
+                # COCO bbox: [x, y, width, height] (top-left corner)
+                # YOLO bbox: [center_x, center_y, width, height] (normalized)
+
+                x, y, w, h = ann['bbox']
+
+                # Normalize coordinates
+                center_x = (x + w/2) / width
+                center_y = (y + h/2) / height
+                norm_w = w / width
+                norm_h = h / height
+
+                # Class ID (YOLO 0-indexed olacak şekilde)
+                class_id = ann['category_id'] - 1  # COCO 1-indexed, YOLO 0-indexed
+
+                f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {norm_w:.6f} {norm_h:.6f}\n")
+
+        # Resmi kopyala (opsiyonel)
+        src_image_path = os.path.join(image_dir, filename)
+        dst_image_path = os.path.join(images_dir, filename)
+
+        if os.path.exists(src_image_path):
+            import shutil
+            shutil.copy2(src_image_path, dst_image_path)
+
+# YOLO formatına dönüştür
+OUTPUT_DIR = "/content/drive/MyDrive/yolo_dataset"
+print("🔄 COCO formatından YOLO formatına dönüştürülüyor...")
+
+if 'coco_data' in locals():
+    convert_coco_to_yolo(coco_data, IMAGE_DIR, OUTPUT_DIR)
+    print(f"✅ Dönüştürme tamamlandı! Dosyalar: {OUTPUT_DIR}")
+else:
+    print("❌ COCO verisi yüklenemedi!")
+
+# =============================================================================
+# BLOK 5: Train/Validation Split ve Dataset Hazırlama
+# =============================================================================
+
+def create_train_val_split(output_dir, train_ratio=0.8):
+    """Train ve validation setlerini ayır"""
+
+    images_dir = os.path.join(output_dir, 'images')
+    labels_dir = os.path.join(output_dir, 'labels')
+
+    # Tüm resim dosyalarını listele
+    image_files = [f for f in os.listdir(images_dir)
+                   if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    # Train/Val split
+    train_images, val_images = train_test_split(
+        image_files,
+        train_size=train_ratio,
+        random_state=42
+    )
+
+    print(f"📊 Dataset split:")
+    print(f"  Training images: {len(train_images)}")
+    print(f"  Validation images: {len(val_images)}")
+
+    # Train ve val klasörlerini oluştur
+    for split_name, image_list in [('train', train_images), ('val', val_images)]:
+        split_images_dir = os.path.join(output_dir, split_name, 'images')
+        split_labels_dir = os.path.join(output_dir, split_name, 'labels')
+
+        os.makedirs(split_images_dir, exist_ok=True)
+        os.makedirs(split_labels_dir, exist_ok=True)
+
+        # Dosyaları taşı
+        for img_file in image_list:
+            # Resim dosyası
+            src_img = os.path.join(images_dir, img_file)
+            dst_img = os.path.join(split_images_dir, img_file)
+
+            # Label dosyası
+            label_file = os.path.splitext(img_file)[0] + '.txt'
+            src_label = os.path.join(labels_dir, label_file)
+            dst_label = os.path.join(split_labels_dir, label_file)
+
+            if os.path.exists(src_img):
+                shutil.move(src_img, dst_img)
+            if os.path.exists(src_label):
+                shutil.move(src_label, dst_label)
+
+    return len(train_images), len(val_images)
+
+# Train/Val split yap
+if os.path.exists(OUTPUT_DIR):
+
+# BLOK 6: YAML Konfigürasyon Dosyası Oluşturma
+# =============================================================================
+
+def create_yaml_config(output_dir, class_names):
+    """YOLOv8 için YAML konfigürasyon dosyası oluştur"""
+
+    yaml_content = f"""# Yabani Ot Tespiti Dataset Konfigürasyonu
+path: {output_dir}  # dataset root dir
+train: train/images  # train images (relative to 'path')
+val: val/images  # val images (relative to 'path')
+
+# Classes
+nc: {len(class_names)}  # number of classes
+names: {list(class_names.values())}  # class names
+"""
+
+    yaml_path = os.path.join(output_dir, 'dataset.yaml')
+    with open(yaml_path, 'w', encoding='utf-8') as f:
+        f.write(yaml_content)
+
+    print(f"📝 YAML konfigürasyonu oluşturuldu: {yaml_path}")
+    print("\n📋 Dataset konfigürasyonu:")
+    print(yaml_content)
+
+    return yaml_path
+
+# YAML dosyası oluştur
+if 'class_names' in locals() and os.path.exists(OUTPUT_DIR):
+    yaml_path = create_yaml_config(OUTPUT_DIR, class_names)
+else:
+    print("❌ Sınıf bilgileri veya dataset klasörü bulunamadı!")
+
+print("\n🎯 Dataset hazırlama işlemi tamamlandı!")
+print("📂 Klasör yapısı:")
+print(f"  {OUTPUT_DIR}/")
+print(f"  ├── train/")
+print(f"  │   ├── images/")
+print(f"  │   └── labels/")
+print(f"  ├── val/")
+print(f"  │   ├── images/")
+print(f"  │   └── labels/")
+print(f"  └── dataset.yaml")
+    train_count, val_count = create_train_val_split(OUTPUT_DIR)
+    print("✅ Train/Validation split tamamlandı!")
+else:
+    print("❌ YOLO dataset klasörü bulunamadı!")
+
+# =============================================================================
+# BLOK 7: YOLOv8 Kurulumu ve Model Hazırlama
+# =============================================================================
+
+# YOLOv8 kurulumu (Colab'da çalıştırın)
+print("📦 YOLOv8 kuruluyor...")
+# !pip install ultralytics
+
+# YOLOv8 import
+from ultralytics import YOLO
+import yaml
+
+# Model seçimi (boyuta göre seçebilirsiniz)
+MODEL_SIZE = 'n'  # 'n' (nano), 's' (small), 'm' (medium), 'l' (large), 'x' (extra large)
+model_name = f'yolov8{MODEL_SIZE}.pt'
+
+print(f"🤖 Model yükleniyor: {model_name}")
+model = YOLO(model_name)  # Pretrained model yükle
+
+print("✅ YOLOv8 model hazır!")
+
+# =============================================================================
+# BLOK 8: Model Eğitimi
+# =============================================================================
+
+def train_yolov8_model(model, yaml_path, epochs=100, imgsz=640, batch_size=16):
+    """YOLOv8 modelini eğit"""
+
+    print("🚀 Model eğitimi başlıyor...")
+    print(f"📊 Eğitim parametreleri:")
+    print(f"  Epochs: {epochs}")
+    print(f"  Image size: {imgsz}")
+    print(f"  Batch size: {batch_size}")
+
+    # Eğitimi başlat
+    results = model.train(
+        data=yaml_path,           # Dataset YAML dosyası
+        epochs=epochs,            # Epoch sayısı
+        imgsz=imgsz,             # Resim boyutu
+        batch=batch_size,        # Batch boyutu
+        patience=10,             # Early stopping patience
+        save=True,               # Model kaydet
+        device='0' if torch.cuda.is_available() else 'cpu',  # GPU kullan
+        workers=2,               # DataLoader worker sayısı
+        project='yolo_weed_detection',  # Proje klasörü
+        name='weed_model',       # Model adı
+        verbose=True             # Detaylı log
+    )
+
+    print("✅ Model eğitimi tamamlandı!")
+    return results
+
+# Model eğitimini başlat
+if 'yaml_path' in locals() and 'model' in locals():
+    print("⏳ Eğitim başlatılıyor... (Bu işlem uzun sürebilir)")
+    training_results = train_yolov8_model(
+        model=model,
+        yaml_path=yaml_path,
+        epochs=100,      # İhtiyacınıza göre ayarlayın
+        imgsz=640,       # Resim boyutu
+        batch_size=16    # Batch boyutu (GPU'nuz sınırlıysa azaltın)
+    )
+else:
+    print("❌ Model veya YAML dosyası bulunamadı!")
